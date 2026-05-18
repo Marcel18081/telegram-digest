@@ -1,0 +1,6 @@
+google-genai
+requests
+python-dotenv
+pdfplumber
+python-docx
+openpyxl
