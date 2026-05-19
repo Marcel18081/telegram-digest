@@ -375,6 +375,12 @@ def main() -> None:
 
     print(digest)
     send_telegram(digest)
+
+    # Write today's marker so fallback job knows digest was sent
+    marker = os.path.join(os.path.dirname(__file__), "digest_last_sent")
+    with open(marker, "w") as f:
+        f.write(datetime.now().strftime("%Y-%m-%d"))
+
     print("\nSent to Telegram ✓")
 
 
