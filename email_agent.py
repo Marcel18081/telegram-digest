@@ -10,7 +10,9 @@ import email.header
 import io
 import json
 import os
+import subprocess
 import sys
+import time
 from typing import Optional
 import requests
 from google import genai
@@ -18,6 +20,15 @@ from google.genai import types
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from dotenv import load_dotenv
+
+# Force line-buffered output so logs appear even when running under launchd
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+
+def log(msg: str) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -229,6 +240,103 @@ def classify_action(m: dict, sent: list, drafts: list) -> str:
     return "новое"
 
 
+# ── Calendar (AppleScript) ────────────────────────────────────────────────────
+
+WORK_CALENDARS = ["Рабочий", "Календарь", "Calendar"]
+
+_CAL_SCRIPT = """
+tell application "Calendar"
+    activate
+    delay 1
+    set out to ""
+    set d1 to date "{date_from}"
+    set d2 to date "{date_to}"
+    repeat with calName in {{{cal_names}}}
+        try
+            set c to calendar calName
+            repeat with e in (every event of c whose start date >= d1 and start date <= d2)
+                set out to out & (summary of e) & "§" & ((start date of e) as string) & "§" & ((end date of e) as string) & "¶"
+            end repeat
+        end try
+    end repeat
+    return out
+end tell
+"""
+
+
+def _parse_as_date(s: str) -> Optional[datetime]:
+    s = s.strip()
+    for fmt in (
+        "%A, %d %B %Y at %H:%M:%S",
+        "%A, %B %d, %Y at %I:%M:%S %p",
+        "%A, %d %B %Y г. в %H:%M:%S",
+    ):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _as_fmt(dt: datetime) -> str:
+    return dt.strftime("%A, %d %B %Y at %H:%M:%S")
+
+
+def get_upcoming_events(days: int = 7) -> list:
+    """Return events from Apple Calendar for the next N days."""
+    cal_names = ", ".join(f'"{c}"' for c in WORK_CALENDARS)
+    now = datetime.now().replace(hour=0, minute=0, second=0)
+    script = _CAL_SCRIPT.format(
+        date_from=_as_fmt(now),
+        date_to=_as_fmt(now + timedelta(days=days)),
+        cal_names=cal_names,
+    )
+    try:
+        raw = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+    except Exception as exc:
+        log(f"AppleScript error: {exc}")
+        return []
+
+    events = []
+    for line in raw.split("¶"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("§")
+        if len(parts) < 3:
+            continue
+        start = _parse_as_date(parts[1])
+        end   = _parse_as_date(parts[2])
+        if start and end:
+            events.append({"title": parts[0], "start": start, "end": end})
+    events.sort(key=lambda e: e["start"])
+    return events
+
+
+# ── Tasks ──────────────────────────────────────────────────────────────────────
+
+TASKS_FILE = os.path.join(os.path.dirname(__file__), "tasks.json")
+
+
+def get_open_tasks_for_digest() -> dict:
+    """Return open meeting and personal tasks as two lists."""
+    if not os.path.exists(TASKS_FILE):
+        return {"meeting": [], "personal": []}
+    try:
+        with open(TASKS_FILE, encoding="utf-8") as f:
+            all_tasks = json.load(f)
+    except Exception:
+        return {"meeting": [], "personal": []}
+
+    return {
+        "meeting":  [t for t in all_tasks if t["type"] == "meeting"  and not t["done"]],
+        "personal": [t for t in all_tasks if t["type"] == "personal" and not t["done"]],
+    }
+
+
 # ── Claude AI ────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """Ты — многолетний личный ассистент совладельца международной строительной компании (проекты в России, Японии, Индии).
@@ -236,9 +344,9 @@ SYSTEM_PROMPT = """Ты — многолетний личный ассистен
 Пиши по-русски. Используй HTML-разметку Telegram: <b>жирный</b>, <i>курсив</i>.
 Будь краток, но не теряй важное. Действуй как опытный бизнес-ассистент."""
 
-DIGEST_PROMPT = """Вот данные по входящим письмам за последние сутки и напоминания по старым письмам.
+DIGEST_PROMPT = """Вот полные данные для утреннего дайджеста: письма, встречи на неделю, задачи.
 
-{emails_json}
+{payload_json}
 
 Составь утренний дайджест в следующей структуре:
 
@@ -256,13 +364,20 @@ DIGEST_PROMPT = """Вот данные по входящим письмам за
 
 Раздел 4: <b>✅ ОБРАБОТАНО ВЧЕРА</b> — на что уже ответил или переслал
 
-В конце — <b>⚡ ПРИОРИТЕТЫ НА СЕГОДНЯ</b>: 3-5 пунктов самого важного.
+Раздел 5: <b>📅 ВСТРЕЧИ НА НЕДЕЛЮ</b> — по дням, с временем и длительностью. Если встреч нет — «Свободная неделя».
+
+Раздел 6: <b>📋 ЗАДАЧИ ПО ВСТРЕЧАМ</b> — открытые задачи, связанные с переговорами. Если нет — «Задач нет».
+
+Раздел 7: <b>📝 ЛИЧНЫЕ ЗАДАЧИ</b> — открытые личные дела. Если нет — «Задач нет».
+
+В конце — <b>⚡ ПРИОРИТЕТЫ НА СЕГОДНЯ</b>: 3-5 пунктов самого важного, с учётом всех разделов.
 
 Пиши конкретно и по делу, как опытный ассистент директора."""
 
 
 def build_digest_with_gemini(new_emails: list, unanswered: list,
-                              sent: list, drafts: list) -> str:
+                              sent: list, drafts: list,
+                              events: list, tasks: dict) -> str:
     client = genai.Client(api_key=GEMINI_KEY)
 
     def email_to_dict(m: dict, status: str) -> dict:
@@ -282,6 +397,24 @@ def build_digest_with_gemini(new_emails: list, unanswered: list,
             ]
         return d
 
+    def event_to_dict(e: dict) -> dict:
+        duration = int((e["end"] - e["start"]).total_seconds() / 60)
+        dur_str = f"{duration // 60}ч" if duration >= 60 else f"{duration}мин"
+        return {
+            "название": e["title"],
+            "день":     e["start"].strftime("%-d %B, %A"),
+            "время":    e["start"].strftime("%H:%M"),
+            "длина":    dur_str,
+        }
+
+    def task_to_dict(t: dict) -> dict:
+        d: dict = {"задача": t["title"]}
+        if t.get("due_date"):
+            d["дедлайн"] = t["due_date"]
+        if t.get("linked_meeting"):
+            d["встреча"] = t["linked_meeting"]
+        return d
+
     payload = {
         "новые_письма": [
             email_to_dict(m, classify_action(m, sent, drafts))
@@ -295,10 +428,13 @@ def build_digest_with_gemini(new_emails: list, unanswered: list,
             {"тема": d["subject"], "кому": d["to"], "возраст": f"{int((datetime.now(timezone.utc) - d['date']).total_seconds()/3600)}ч"}
             for d in drafts[:10]
         ],
+        "встречи_на_неделю": [event_to_dict(e) for e in events],
+        "задачи_по_встречам": [task_to_dict(t) for t in tasks.get("meeting", [])],
+        "личные_задачи": [task_to_dict(t) for t in tasks.get("personal", [])],
     }
 
     prompt = SYSTEM_PROMPT + "\n\n" + DIGEST_PROMPT.format(
-        emails_json=json.dumps(payload, ensure_ascii=False, indent=2),
+        payload_json=json.dumps(payload, ensure_ascii=False, indent=2),
         date=datetime.now().strftime("%d.%m.%Y, %A"),
     )
 
@@ -332,56 +468,78 @@ def send_telegram(text: str) -> None:
             "parse_mode": "HTML",
         }, timeout=15)
         if not resp.ok:
-            print(f"Telegram error: {resp.text}", file=sys.stderr)
+            log(f"Telegram error: {resp.text}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def connect_with_retry(max_attempts: int = 4, delay: int = 20) -> imaplib.IMAP4_SSL:
+    """Try to connect to IMAP, retrying on failure (network may not be ready after wake)."""
+    last_exc: Exception = RuntimeError("no attempts made")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return connect()
+        except Exception as exc:
+            last_exc = exc
+            log(f"IMAP connection attempt {attempt}/{max_attempts} failed: {exc}")
+            if attempt < max_attempts:
+                log(f"Retrying in {delay}s...")
+                time.sleep(delay)
+    raise last_exc
+
+
 def main() -> None:
-    print("Connecting to mail.ru...")
-    conn = connect()
+    log("Starting email agent")
+    log("Connecting to mail.ru...")
+    conn = connect_with_retry()
 
     sent_folder   = find_folder_by_flag(conn, "\\Sent")
     drafts_folder = find_folder_by_flag(conn, "\\Drafts")
-    print(f"Folders — sent: {sent_folder}, drafts: {drafts_folder}")
+    log(f"Folders — sent: {sent_folder}, drafts: {drafts_folder}")
 
-    print("Fetching new emails (24h)...")
+    log("Fetching new emails (24h)...")
     new_inbox = fetch_emails(conn, "INBOX", NEW_MAIL_HOURS, full_body=True)
 
-    print("Fetching sent (2 weeks)...")
+    log("Fetching sent (2 weeks)...")
     sent = fetch_emails(conn, sent_folder, UNANSWERED_WINDOW_DAYS * 24,
                         full_body=False) if sent_folder else []
 
-    print("Fetching all inbox for unanswered check (2 weeks)...")
+    log("Fetching all inbox for unanswered check (2 weeks)...")
     all_inbox = fetch_emails(conn, "INBOX", UNANSWERED_WINDOW_DAYS * 24,
                              full_body=False)
 
-    print("Fetching drafts...")
+    log("Fetching drafts...")
     drafts = fetch_emails(conn, drafts_folder, UNANSWERED_WINDOW_DAYS * 24,
                           full_body=False) if drafts_folder else []
 
     conn.logout()
 
     unanswered = find_unanswered(all_inbox, sent)
-    # exclude emails already covered in new_inbox
     new_ids = {m["message_id"] for m in new_inbox}
     unanswered_old = [m for m in unanswered if m["message_id"] not in new_ids]
 
-    print(f"New: {len(new_inbox)}, unanswered old: {len(unanswered_old)}, "
-          f"sent: {len(sent)}, drafts: {len(drafts)}")
+    log(f"New: {len(new_inbox)}, unanswered old: {len(unanswered_old)}, "
+        f"sent: {len(sent)}, drafts: {len(drafts)}")
 
-    print("Calling Gemini API...")
-    digest = build_digest_with_gemini(new_inbox, unanswered_old, sent, drafts)
+    log("Fetching calendar events...")
+    events = get_upcoming_events(days=7)
+    log(f"Events: {len(events)}")
 
-    print(digest)
+    log("Reading tasks...")
+    tasks = get_open_tasks_for_digest()
+    log(f"Tasks — meeting: {len(tasks['meeting'])}, personal: {len(tasks['personal'])}")
+
+    log("Calling Gemini API...")
+    digest = build_digest_with_gemini(new_inbox, unanswered_old, sent, drafts, events, tasks)
+
+    print(digest, flush=True)
     send_telegram(digest)
 
-    # Write today's marker so fallback job knows digest was sent
     marker = os.path.join(os.path.dirname(__file__), "digest_last_sent")
     with open(marker, "w") as f:
         f.write(datetime.now().strftime("%Y-%m-%d"))
 
-    print("\nSent to Telegram ✓")
+    log("Sent to Telegram ✓")
 
 
 if __name__ == "__main__":
