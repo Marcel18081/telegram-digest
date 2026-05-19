@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 Interactive Telegram bot.
-📬 Письма  — morning email digest
-📅 Встречи — Apple Calendar view + natural-language event creation
+📬 Письма             — morning email digest
+📅 Встречи            — Apple Calendar view + natural-language event management
+📋 Задачи по встречам — tasks linked to meetings
+📝 Личные задачи      — personal to-do list
 """
 
 import json
@@ -11,6 +13,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
@@ -37,10 +40,104 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 KEYBOARD = {
-    "keyboard": [[{"text": "📬 Письма"}, {"text": "📅 Встречи"}]],
+    "keyboard": [
+        [{"text": "📬 Письма"},            {"text": "📅 Встречи"}],
+        [{"text": "📋 Задачи по встречам"}, {"text": "📝 Личные задачи"}],
+    ],
     "resize_keyboard": True,
     "persistent": True,
 }
+
+# Tracks which section the user is currently in; used to route free-text messages
+_user_context = "default"  # "default" | "meetings" | "meeting_tasks" | "personal_tasks"
+
+# ── Task storage ──────────────────────────────────────────────────────────────
+
+TASKS_FILE = os.path.join(os.path.dirname(__file__), "tasks.json")
+
+
+def load_tasks() -> list:
+    if not os.path.exists(TASKS_FILE):
+        return []
+    try:
+        with open(TASKS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_tasks(tasks: list) -> None:
+    with open(TASKS_FILE, "w", encoding="utf-8") as f:
+        json.dump(tasks, f, ensure_ascii=False, indent=2)
+
+
+def task_add(title: str, task_type: str,
+             due_date: Optional[str] = None,
+             linked_meeting: Optional[str] = None) -> dict:
+    tasks = load_tasks()
+    t = {
+        "id":             str(uuid.uuid4())[:8],
+        "type":           task_type,          # "meeting" | "personal"
+        "title":          title,
+        "done":           False,
+        "created_at":     datetime.now().isoformat(),
+        "due_date":       due_date,
+        "linked_meeting": linked_meeting,
+    }
+    tasks.append(t)
+    save_tasks(tasks)
+    return t
+
+
+def task_complete(hint: str) -> Optional[dict]:
+    tasks = load_tasks()
+    hl = hint.lower()
+    for t in tasks:
+        if hl in t["title"].lower() and not t["done"]:
+            t["done"] = True
+            t["completed_at"] = datetime.now().isoformat()
+            save_tasks(tasks)
+            return t
+    return None
+
+
+def task_delete(hint: str) -> Optional[dict]:
+    tasks = load_tasks()
+    hl = hint.lower()
+    for i, t in enumerate(tasks):
+        if hl in t["title"].lower():
+            removed = tasks.pop(i)
+            save_tasks(tasks)
+            return removed
+    return None
+
+
+def get_open_tasks(task_type: str) -> list:
+    return [t for t in load_tasks() if t["type"] == task_type and not t["done"]]
+
+
+def format_tasks(task_type: str) -> str:
+    tasks = get_open_tasks(task_type)
+    icon  = "📋" if task_type == "meeting" else "📝"
+    label = "Задачи по встречам" if task_type == "meeting" else "Личные задачи"
+
+    if not tasks:
+        return (
+            f"{icon} <b>{label}</b>\n\nЗадач нет.\n\n"
+            "Напишите, например:\n"
+            "• «добавь: обсудить смету с Пащенко»\n"
+            "• «до пятницы: позвонить в банк»"
+        )
+
+    lines = [f"{icon} <b>{label}:</b>\n"]
+    for t in tasks:
+        due = f" ⏰ до {t['due_date']}" if t.get("due_date") else ""
+        mtg = f"\n    ↳ {t['linked_meeting']}" if t.get("linked_meeting") else ""
+        lines.append(f"• {t['title']}{due}{mtg}")
+
+    lines.append(f"\n<i>Открытых задач: {len(tasks)}</i>")
+    lines.append("Напишите «выполнено: [название]» или «удалить: [название]»")
+    return "\n".join(lines)
 
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
@@ -393,6 +490,59 @@ NLP_PROMPT = """\
 """
 
 
+TASK_NLP_PROMPT = """\
+Сегодня: {today}. Завтра: {tomorrow}.
+Раздел: {section} (тип задач по умолчанию: "{default_type}").
+
+Пользователь написал: «{text}»
+
+Верни JSON-массив (только JSON, без markdown, без пояснений).
+
+Добавить задачу:
+{{"type":"add_task","task_type":"meeting|personal","title":"текст задачи","due_date":"YYYY-MM-DD или null","linked_meeting":"название встречи или null"}}
+
+Отметить выполненной:
+{{"type":"complete_task","hint":"часть названия задачи"}}
+
+Удалить задачу:
+{{"type":"delete_task","hint":"часть названия задачи"}}
+
+Показать список:
+{{"type":"list_tasks"}}
+
+Непонятное:
+{{"type":"unknown","reply":"текст ответа на русском"}}
+
+Правила:
+- task_type по умолчанию = "{default_type}", только если явно сказано "личная" / "личное" — personal; "встреча" / "по встрече" — meeting
+- "выполнено:", "готово:", "сделано:", "done" → complete_task
+- "удалить:", "убрать:", "удали" → delete_task
+- due_date: "в пятницу", "до 22 мая", "до конца недели" → перевести в YYYY-MM-DD; если не указано → null
+"""
+
+
+def parse_task_intent(text: str, default_type: str, section: str) -> list:
+    today = datetime.now()
+    tomorrow = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+    prompt = TASK_NLP_PROMPT.format(
+        today=today.strftime("%Y-%m-%d"),
+        tomorrow=tomorrow,
+        section=section,
+        default_type=default_type,
+        text=text,
+    )
+    try:
+        resp = AI.models.generate_content(model="gemini-3-flash-preview", contents=prompt)
+        raw = resp.text.strip()
+        raw = re.sub(r"^```json\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        result = json.loads(raw)
+        return result if isinstance(result, list) else [result]
+    except Exception as e:
+        log.error(f"Task Gemini parse error: {e}")
+        return [{"type": "unknown", "reply": "Не удалось распознать команду."}]
+
+
 def parse_intent(text: str) -> list:
     today = datetime.now()
     tomorrow = (today + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -434,7 +584,64 @@ def handle_meetings() -> None:
     send(format_events(events, days=7))
 
 
-def handle_text(text: str) -> None:
+def handle_meeting_tasks() -> None:
+    send(format_tasks("meeting"))
+
+
+def handle_personal_tasks() -> None:
+    send(format_tasks("personal"))
+
+
+def handle_task_text(text: str, task_type: str) -> None:
+    section = "Задачи по встречам" if task_type == "meeting" else "Личные задачи"
+    icon    = "📋" if task_type == "meeting" else "📝"
+    intents = parse_task_intent(text, task_type, section)
+
+    for intent in intents:
+        itype = intent.get("type")
+
+        if itype == "add_task":
+            t_type = intent.get("task_type", task_type)
+            title  = intent.get("title", text)
+            due    = intent.get("due_date")
+            mtg    = intent.get("linked_meeting")
+            task_add(title, t_type, due, mtg)
+            due_str = f" ⏰ до {due}" if due else ""
+            t_icon  = "📋" if t_type == "meeting" else "📝"
+            send(f"✅ {t_icon} Задача добавлена:\n<b>{title}</b>{due_str}")
+
+        elif itype == "complete_task":
+            hint = intent.get("hint", text)
+            t = task_complete(hint)
+            if t:
+                send(f"✅ Выполнено: <b>{t['title']}</b>")
+            else:
+                send(f"❌ Задача «{hint}» не найдена.")
+
+        elif itype == "delete_task":
+            hint = intent.get("hint", text)
+            t = task_delete(hint)
+            if t:
+                send(f"🗑 Задача удалена: <b>{t['title']}</b>")
+            else:
+                send(f"❌ Задача «{hint}» не найдена.")
+
+        elif itype == "list_tasks":
+            send(format_tasks(task_type))
+
+        else:
+            reply = intent.get("reply", "")
+            send(reply if reply else (
+                f"{icon} <b>{section}</b>\n\n"
+                "Напишите:\n"
+                "• «добавь: подготовить смету» — новая задача\n"
+                "• «до пятницы: позвонить Иванову» — с дедлайном\n"
+                "• «выполнено: смета» — отметить выполненной\n"
+                "• «удалить: смета» — удалить задачу"
+            ))
+
+
+def handle_calendar_text(text: str) -> None:
     intents = parse_intent(text)
     created = []
 
@@ -505,31 +712,44 @@ def handle_text(text: str) -> None:
         else:
             reply = intent.get("reply", "")
             send(reply if reply else (
-                "Вот что я умею:\n\n"
-                "📬 <b>Письма</b> — утренний дайджест почты\n"
-                "📅 <b>Встречи</b> — расписание на неделю\n\n"
-                "Или напишите:\n"
+                "Вот что я умею в разделе Встречи:\n\n"
                 "• «добавь встречу с Пащенко завтра в 14:00»\n"
                 "• «созвон с командой в пятницу в 10:00 на 2 часа»\n"
-                "• «покажи встречи на 3 дня»"
+                "• «удали встречу Альфа»\n"
+                "• «покажи встречи на 3 дня»\n\n"
+                "Или нажми другую кнопку для другого раздела."
             ))
 
     if created:
         send("✅ Добавлено в календарь:\n\n" + "\n".join(created))
 
 
+def handle_text(text: str) -> None:
+    """Route free-text message based on the current section context."""
+    global _user_context
+    if _user_context == "meeting_tasks":
+        handle_task_text(text, "meeting")
+    elif _user_context == "personal_tasks":
+        handle_task_text(text, "personal")
+    else:
+        handle_calendar_text(text)
+
+
 def handle_start() -> None:
     send(
         "👋 Привет! Я твой персональный ассистент.\n\n"
-        "📬 <b>Письма</b> — дайджест входящей почты\n"
-        "📅 <b>Встречи</b> — календарь и управление встречами\n\n"
-        "Можешь писать текстом: «добавь встречу...»"
+        "📬 <b>Письма</b> — утренний дайджест почты\n"
+        "📅 <b>Встречи</b> — расписание, добавить / удалить / перенести\n"
+        "📋 <b>Задачи по встречам</b> — задачи, связанные с переговорами\n"
+        "📝 <b>Личные задачи</b> — личный список дел\n\n"
+        "Нажми на кнопку или пиши текстом — я пойму контекст."
     )
 
 
 # ── Polling loop ──────────────────────────────────────────────────────────────
 
 def run() -> None:
+    global _user_context
     log.info("Bot started. Polling...")
     offset = 0
 
@@ -551,18 +771,26 @@ def run() -> None:
                 chat_id = msg.get("chat", {}).get("id")
                 text = msg.get("text", "").strip()
 
-                # Only respond to authorized user
                 if chat_id != CHAT_ID:
                     continue
 
-                log.info(f"Message: {text!r}")
+                log.info(f"[{_user_context}] Message: {text!r}")
 
                 if text in ("/start", "/help"):
+                    _user_context = "default"
                     handle_start()
                 elif text == "📬 Письма":
+                    _user_context = "email"
                     handle_digest()
                 elif text == "📅 Встречи":
+                    _user_context = "meetings"
                     handle_meetings()
+                elif text == "📋 Задачи по встречам":
+                    _user_context = "meeting_tasks"
+                    handle_meeting_tasks()
+                elif text == "📝 Личные задачи":
+                    _user_context = "personal_tasks"
+                    handle_personal_tasks()
                 elif text:
                     handle_text(text)
 
